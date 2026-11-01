@@ -1,0 +1,29 @@
+\begin{table}[t]\centering\footnotesize
+\caption{Pooled held-out RMS (RSS over the fitted constituents, cm) by gauge class. Open: snapped 2° cell deeper than 1000\,m; coastal: shallower. Reference rows: external atlas at the gauge (native grid) and block-averaged onto the 2° grid and read through the same gauge operator, i.e.\ the error floor of a perfect 2° model.}
+\label{tab:benchmark}
+\begin{tabular}{lccccc}
+\toprule
+design & model & all & open & coastal & $n$ (all/open/coastal) \\
+\midrule
+hash & PHYS & 38.0 & 21.6 & 55.3 & 221/128/93 \\
+hash & POLY2 & 39.8 & 21.2 & 58.8 & 221/128/93 \\
+hash & NN-8 & 34.7 & 20.6 & 49.9 & 221/128/93 \\
+hash & NN-32 & 35.6 & 18.9 & 52.6 & 221/128/93 \\
+hash & NN-128 & 35.5 & 18.5 & 52.7 & 221/128/93 \\
+hash & NN-32[Hs] & 37.3 & 20.1 & 55.0 & 221/128/93 \\
+hash & NN-32[Hs+abslat] & 34.1 & 19.4 & 49.7 & 221/128/93 \\
+hash & GP (data only) & 48.0 & 26.7 & 70.2 & 221/128/93 \\
+hash & equilibrium & 56.5 & 42.1 & 74.4 & 221/128/93 \\
+block & PHYS & 39.3 & 22.4 & 57.2 & 221/128/93 \\
+block & NN-8 & 43.5 & 21.6 & 65.2 & 221/128/93 \\
+block & NN-32 & 44.7 & 23.2 & 66.5 & 221/128/93 \\
+block & NN-128 & 41.4 & 20.9 & 61.9 & 221/128/93 \\
+block & NN-32[Hs] & 38.8 & 22.6 & 56.2 & 221/128/93 \\
+block & NN-32[Hs+abslat] & 39.0 & 21.6 & 57.2 & 221/128/93 \\
+block & GP (data only) & 54.7 & 39.6 & 73.1 & 221/128/93 \\
+block & equilibrium & 56.5 & 42.1 & 74.4 & 221/128/93 \\
+reference & GOT4.10c @ gauge (native grid) & 9.9 & 5.4 & 14.7 & 221/128/93 \\
+reference & GOT4.10c @ 2° cell (repr. floor) & 22.8 & 8.7 & 35.4 & 221/128/93 \\
+\bottomrule
+\end{tabular}
+\end{table}

@@ -1,0 +1,15 @@
+\begin{table}[t]\centering\footnotesize
+\caption{Verification at initial parameters: discrete energy identity, solver residual and adjoint gradient check (central FD, $h=10^{-3}$). Timing: median of three loss+gradient evaluations (M$_2$, K$_1$) after one warm-up.}
+\label{tab:check}
+\begin{tabular}{lccccccc}
+\toprule
+closure & \#p & $D_{M_2}$ [TW] & $|W-D|/W$ $M_2$ & $K_1$ & $\|A x-b\|/\|b\|$ & max grad err & loss+grad [s] \\
+\midrule
+\textsc{PHYS} & 4 & 4.559 & 2.1e-16 & 1.1e-16 & 4.3e-13 & 7.8e-07 & 0.33 \\
+\textsc{PHYS-fc} & 4 & 4.563 & 2.1e-16 & 2.3e-16 & 5.7e-13 & 7.1e-07 & 0.33 \\
+\textsc{POLY2} & 11 & 5.493 & 1.8e-16 & 6.1e-16 & 8.0e-13 & 4.2e-07 & 0.33 \\
+\textsc{NN-8} & 114 & 5.246 & 1.9e-16 & 2.2e-16 & 9.0e-13 & 1.5e-07 & 0.33 \\
+\textsc{NN-8} + energy & 114 & 5.246 & 1.9e-16 & 2.2e-16 & 9.0e-13 & 1.4e-07 & 0.34 \\
+\bottomrule
+\end{tabular}
+\end{table}

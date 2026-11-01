@@ -1,0 +1,21 @@
+{
+ "delta_m": 1.0,
+ "rows": {
+  "phys": {
+   "area_mean_cm_per_m": 0.0702068826904212,
+   "frac_cells_all_folds_agree": 0.9500871169416829,
+   "p95_abs_cm_per_m": 0.3399107293094578,
+   "gauge_mean_cm_per_m": 0.1576127176732647,
+   "gauge_frac_increase": 0.6434782608695652,
+   "n_folds": 5
+  },
+  "nn:8": {
+   "area_mean_cm_per_m": 0.05930929992123036,
+   "frac_cells_all_folds_agree": 0.25140924464487036,
+   "p95_abs_cm_per_m": 0.8289274815458741,
+   "gauge_mean_cm_per_m": 0.10867902092520743,
+   "gauge_frac_increase": 0.5478260869565217,
+   "n_folds": 5
+  }
+ }
+}

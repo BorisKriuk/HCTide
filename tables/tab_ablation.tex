@@ -1,0 +1,16 @@
+\begin{table}[t]\centering\footnotesize
+\caption{Energy-penalty ablation (hash CV, fold means). With the $D_{M_2}$ target only ($\mu_D=1$, $\mu_{\rm sh}=0$) the shelf share $f_{\rm sh}$ is not optimised and is an independent outcome; with both targets it is partly imposed by construction. Open/coastal: pooled held-out RMS at gauges whose 2° cell is deeper/shallower than 1000\,m.}
+\label{tab:ablation}
+\begin{tabular}{lcccccc}
+\toprule
+closure & penalty & held-out [cm] & $D_{M_2}$ [TW] & $f_{\rm sh}$ [\%] & open [cm] & coastal [cm] \\
+\midrule
+\textsc{PHYS} & none & $37.7\pm5.5$ & 2.55 & $21\pm1$ & 21.7 & 54.6 \\
+\textsc{NN-8} & none & $34.5\pm3.3$ & 2.87 & $18\pm1$ & 20.6 & 49.3 \\
+\textsc{PHYS} & $D_{M_2}$ + shelf & $41.3\pm5.5$ & 2.25 & $48\pm1$ & 26.3 & 58.2 \\
+\textsc{NN-8} & $D_{M_2}$ + shelf & $39.3\pm6.6$ & 2.38 & $57\pm3$ & 23.3 & 56.4 \\
+\textsc{PHYS} & $D_{M_2}$ only & $37.8\pm5.5$ & 2.46 & $23\pm1$ & 21.5 & 54.8 \\
+\textsc{NN-8} & $D_{M_2}$ only & $36.7\pm4.3$ & 2.42 & $19\pm3$ & 20.0 & 53.7 \\
+\bottomrule
+\end{tabular}
+\end{table}

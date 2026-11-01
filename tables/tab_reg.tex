@@ -1,0 +1,19 @@
+\begin{table}[t]\centering\footnotesize
+\caption{Weight-decay sweep (hash CV, mean $\pm$ s.d. over folds, cm).}
+\label{tab:reg}
+\begin{tabular}{lccccc}
+\toprule
+closure & $\lambda$ & in-sample & held-out & gap & $D_{M_2}$ [TW] \\
+\midrule
+\textsc{NN-8} & 1e-03 & $36.2\pm1.0$ & $37.6\pm6.1$ & +1.4 & 2.59 \\
+\textsc{NN-32} & 1e-03 & $35.9\pm1.0$ & $37.7\pm5.7$ & +1.8 & 2.74 \\
+\textsc{NN-128} & 1e-03 & $35.9\pm0.8$ & $37.8\pm6.2$ & +1.9 & 2.73 \\
+\textsc{NN-8} & 1e-04 & $32.5\pm1.9$ & $34.4\pm3.6$ & +1.9 & 2.85 \\
+\textsc{NN-32} & 1e-04 & $31.3\pm1.7$ & $34.7\pm3.8$ & +3.4 & 3.01 \\
+\textsc{NN-128} & 1e-04 & $30.3\pm1.5$ & $35.1\pm4.8$ & +4.8 & 2.95 \\
+\textsc{NN-8} & 1e-06 & $32.7\pm2.3$ & $34.5\pm3.3$ & +1.9 & 2.87 \\
+\textsc{NN-32} & 1e-06 & $30.6\pm1.8$ & $35.4\pm3.9$ & +4.8 & 3.02 \\
+\textsc{NN-128} & 1e-06 & $29.2\pm2.1$ & $35.1\pm5.7$ & +5.9 & 3.00 \\
+\bottomrule
+\end{tabular}
+\end{table}
