@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <b>HCTide: A Hard-Constrained Differentiable Framework for Learning and Auditing Tidal Dissipation Closures.</b><br>
+  <b>HCTide: A Hard-Constrained Differentiable Framework for Learning and Auditing Tidal Dissipation Closures</b><br>
   Differentiable tide equations, sparse LU solves, implicit adjoints, learnable dissipation, and experiments.
 </p>
 
