@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
 """
-experiments.py — every experiment in the paper (cached per fit) + figures (PDF/PNG + pgfplots .dat) + LaTeX tables.
+experiments.py — every experiment in the HCTide paper (cached per fit) + figures (PDF/PNG + pgfplots .dat)
+                 + LaTeX tables (booktabs).
 
   python experiments.py all [--quick] [--skip-res]
   python experiments.py check      E0 energy identity + adjoint gradcheck (PHYS, PHYS-fc, NN-8, POLY2, NN-8+energy)
   python experiments.py cv         E1 5-fold hash CV: capacity ladder + feature ablation  (Table: main)
-  python experiments.py block      E2 spatial-block CV (k-means blocks on the sphere)       [H2]
+  python experiments.py block      E2 spatial-block CV (k-means blocks on the sphere)
   python experiments.py reg        E3 lambda x width sweep
-  python experiments.py transfer   E4 fit on M2 only, predict S2,K1,O1 (frequency transfer) [H1]
-  python experiments.py energy     E5 energy-constrained fits, skill/admissibility Pareto   [H4]
-  python experiments.py distill    E6 distil NN-8 into polynomial laws + partial dependence [H3]
-  python experiments.py slr        E7 spring-range sensitivity to +1 m sea level (fold ensemble) [H5]
-  python experiments.py res        E8 2° vs 1° on a common gauge set                         [H6]
+  python experiments.py transfer   E4 fit on M2 only, predict S2,K1,O1 (frequency transfer)
+  python experiments.py energy     E5 energy-constrained fits, skill/admissibility Pareto
+  python experiments.py ablation   E5b energy-penalty ablation: D_M2 target only (mu_sh = 0) -> the shelf share
+                                       becomes an independent outcome (answers the circularity question)
+  python experiments.py distill    E6 distil NN-8 into polynomial laws + partial dependence
+  python experiments.py slr        E7 spring-range sensitivity to +1 m sea level (fold ensemble)
+  python experiments.py benchmark  E9 open-ocean vs coastal gauge strata; optional external atlas (EOT20/FES/TPXO):
+                                       atlas @ gauge, atlas block-averaged @ 2° cell (representativeness floor),
+                                       model vs atlas over deep-ocean and shelf cells.  No new fits.
+  python experiments.py res        E8 2° vs 1° on a common gauge set
+  python experiments.py manifest   provenance: versions, CPU, git commit, gauge digest, exclusions, total fit time
   python experiments.py figures    figs/*.pdf|png|dat, tables/*.tex from results/summary_*.json
 Each fit is cached in results/runs/<hash>.json (+ fields .npz); reruns skip finished fits.
+Results directory: $HCTIDE_RESULTS (default ./results).
 """
 import argparse, hashlib, json, math, time
+from pathlib import Path
 import numpy as np
 import torch
 import tide as T
@@ -23,10 +32,11 @@ import tide as T
 RUNS, FIELDS = T.RESULTS / "runs", T.RESULTS / "fields"
 FIGS, TABS = T.ROOT / "figs", T.ROOT / "tables"
 MAIN = ["phys", "poly:2", "nn:8", "nn:32", "nn:128", "nn:32:2:H+slope", "nn:32:2:H+slope+abslat"]
-CORE = ["phys", "nn:8", "nn:32", "nn:128", "nn:32:2:H+slope"]
+CORE = ["phys", "nn:8", "nn:32", "nn:128", "nn:32:2:H+slope", "nn:32:2:H+slope+abslat"]
 FAMILY = ["nn:8", "nn:32", "nn:128"]
 TRANSFER = ["phys", "physfc", "nn:8", "nn:8:2:H+slope+abslat", "nn:8:2:H+slope+fw"]
 LAMBDAS, MUS = [1e-3, 1e-4, 1e-6], [0.0, 0.03, 0.1, 0.3, 1.0]
+ABLATION = [("none", None), ("$D_{M_2}$ + shelf", dict(mu_D=1.0, mu_sh=1.0)), ("$D_{M_2}$ only", dict(mu_D=1.0, mu_sh=0.0))]
 W1, W2 = 3.5, 7.16                                # IEEE column / text width [in]
 
 
@@ -59,6 +69,7 @@ def folds(a):
 
 
 def base_cfg(a, **kw):
+    # NOTE: keys/values here define the run-cache hash; do not add keys or cached fits will be recomputed.
     c = dict(res=a.res, year=a.year, seed=a.seed, k=a.kfolds, iters=a.iters, scheme="hash", buffer_km=0.0,
              names=a.constituents.split(","), names_eval=None, l2_nn=a.l2_nn, l2_phys=a.l2_phys, energy=None)
     c.update(kw)
@@ -135,8 +146,11 @@ def summarise(res, ref="phys"):
                    pooled_eq=rms(p, "e_eq"), vs_gp=T.paired_bootstrap(p["e_model"], p["e_gp"], p["test_w"]),
                    p_gp_foldmean=A("p_vs_gp").mean(), D=A("D_TW").mean(), D_sd=A("D_TW").std(),
                    D_all={n: float(np.mean([r["D_TW_all"][n] for r in recs])) for n in recs[0]["D_TW_all"]},
-                   shallow=A("shallow_frac").mean(), polar=A("polar_frac").mean(), beta=A("beta").mean(),
+                   shallow=A("shallow_frac").mean(), shallow_sd=A("shallow_frac").std(),
+                   polar=A("polar_frac").mean(), beta=A("beta").mean(),
                    r_eff_q=np.mean([r["r_eff_q"] for r in recs], 0), seconds=A("seconds").mean(),
+                   n_evals=A("n_evals").mean(),
+                   sec_per_eval=float(np.mean([r["seconds"] / max(r["n_evals"], 1) for r in recs])),
                    energy_closure_max=float(max(abs(v) for r in recs for v in r["energy_closure"].values())),
                    out_row={n: float(np.mean([r["held_out_row"][n] for r in recs])) for n in nm},
                    out_row_sd={n: float(np.std([r["held_out_row"][n] for r in recs])) for n in nm},
@@ -161,6 +175,23 @@ def load(name):
     return json.loads(f.read_text()) if f.exists() else None
 
 
+def _gauge_geo(ctx):
+    """id -> index, snapped cell indices and snapped-cell depth (used for open-ocean / coastal strata)."""
+    g = ctx.g
+    idx = {int(r["id"]): k for k, r in enumerate(g)}
+    gj, gi = np.array([r["j"] for r in g]), np.array([r["i"] for r in g])
+    return idx, gj, gi, ctx.m.H_np[gj, gi]
+
+
+def _strata(Hk, open_depth, valid=None):
+    v = np.ones(len(Hk), bool) if valid is None else valid
+    return dict(all=v, open=v & (Hk >= open_depth), coastal=v & (Hk < open_depth))
+
+
+def _rms_sel(e, w, sel):
+    return float(100 * np.sqrt(np.sum(w[sel] * e[sel]) / np.sum(w[sel]) / 2)) if sel.any() else float("nan")
+
+
 # ============================================================================ experiments
 def exp_check(a):
     ctx = get_ctx(a)
@@ -171,7 +202,7 @@ def exp_check(a):
         r["spec_str"] = spec
         out.append(r)
         print(f"[check] {r['label']:30s} energy " + ", ".join(f"{n}:{e['rel_mismatch']:.1e}" for n, e in r["energy"].items())
-              + " | grad " + ", ".join(f"{d['rel']:.1e}" for d in r["grad"]))
+              + " | grad " + ", ".join(f"{d['rel']:.1e}" for d in r["grad"]) + f" | {r['seconds_loss_and_grad']:.2f} s")
     save("check.json", out)
 
 
@@ -225,6 +256,30 @@ def exp_energy(a):
             rows.append(r)
             print(f"[energy] mu={mu:<5g} {r['label']:28s} out {r['out_mean']:.1f} D {r['D']:.2f} TW shallow {100 * r['shallow']:.0f}%")
     save("summary_energy.json", dict(rows=rows))
+
+
+def exp_ablation(a):
+    """E5b. With mu_sh = 0 only the global D_M2 is targeted, so the shelf share f_sh is NOT optimised for and is an
+    independent outcome. 'none' and 'D+shelf' (mu = 1) are cached from E1/E5; only the 'D only' fits are new."""
+    ctx = get_ctx(a)
+    idx, gj, gi, Hc = _gauge_geo(ctx)
+    rows = []
+    for tag, en in ABLATION:
+        S = summarise(run_cv(ctx, ["phys", "nn:8"], base_cfg(a, energy=en), folds(a)))
+        for r in S["rows"]:
+            P = r["pooled_arrays"]
+            k = np.array([idx[int(round(i))] for i in P["test_ids"]])
+            e, w = np.asarray(P["e_model"], float), np.asarray(P["test_w"], float)
+            st = _strata(Hc[k], a.open_depth)
+            rows.append(dict(spec=r["spec"], label=r["label"], penalty=tag, energy=en, out_mean=r["out_mean"],
+                             out_sd=r["out_sd"], pooled=r["pooled"], D=r["D"], D_sd=r["D_sd"], shallow=r["shallow"],
+                             shallow_sd=r["shallow_sd"], open=_rms_sel(e, w, st["open"]),
+                             coastal=_rms_sel(e, w, st["coastal"]), n_open=int(st["open"].sum()),
+                             n_coastal=int(st["coastal"].sum())))
+            print(f"[ablation] {_short(r['spec']):8s} {tag:22s} out {r['out_mean']:.1f}±{r['out_sd']:.1f}  "
+                  f"D {r['D']:.2f} TW  shelf {100 * r['shallow']:.0f}±{100 * r['shallow_sd']:.0f}%  "
+                  f"open {rows[-1]['open']:.1f}  coastal {rows[-1]['coastal']:.1f}")
+    save("summary_ablation.json", dict(rows=rows, open_depth=a.open_depth))
 
 
 def _feat_points(feats, H, slope, s, om):
@@ -318,6 +373,114 @@ def exp_slr(a):
     save("summary_slr.json", dict(delta_m=a.slr, rows=summ))
 
 
+def exp_benchmark(a):
+    """E9. No new fits. (1) Pooled held-out RMS split into open-ocean gauges (snapped 2° cell >= open_depth) and
+    coastal gauges, for every closure and the GP, under hash and block CV. (2) If a reference atlas is present:
+    atlas @ gauge (native grid: state-of-the-art skill at these stations), atlas block-averaged to the 2° grid and
+    read through the same gauge operator (error floor of a perfect 2° model = representativeness error), and
+    model fields vs the coarsened atlas over deep-ocean and shelf cells (open-ocean benchmark)."""
+    ctx = get_ctx(a)
+    m, g = ctx.m, ctx.g
+    names = a.constituents.split(",")
+    Sh, Sb = load("summary_cv_hash.json"), load("summary_cv_block.json")
+    if not Sh:
+        print("[benchmark] run `python experiments.py cv` first"); return
+    idx, gj, gi, Hc = _gauge_geo(ctx)
+    base = next((r for r in Sh["rows"] if r["spec"] == "phys"), Sh["rows"][0])
+    ids = np.rint(base["pooled_arrays"]["test_ids"]).astype(int)
+    k = np.array([idx[i] for i in ids])
+    w = np.asarray(base["pooled_arrays"]["test_w"], float)
+    lat, lon = np.array([g[q]["lat"] for q in k]), np.array([g[q]["lon"] for q in k])
+    Zo = T.gauge_Z(g)[k][:, [T.MODEL_SET.index(n) for n in names]]
+    Hk = Hc[k]
+    E = {}
+    for design, S in (("hash", Sh), ("block", Sb)):
+        if not S:
+            continue
+        for r in S["rows"]:
+            P = r["pooled_arrays"]
+            if np.array_equal(np.rint(P["test_ids"]).astype(int), ids):
+                E[(design, _short(r["spec"]))] = np.asarray(P["e_model"], float)
+        P0 = S["rows"][0]["pooled_arrays"]
+        if np.array_equal(np.rint(P0["test_ids"]).astype(int), ids):
+            E[(design, "GP (data only)")] = np.asarray(P0["e_gp"], float)
+            E[(design, "equilibrium")] = np.asarray(P0["e_eq"], float)
+    valid, ref2, ref_meta, ref_rows_pc = np.ones(len(k), bool), None, None, {}
+    rdir = Path(a.ref_dir) if a.ref_dir else None
+    if rdir is not None and rdir.exists() and any(rdir.rglob("*.nc")):
+        ref = T.load_reference_atlas(rdir, names)
+        ref2 = {n: T.ref_to_mesh(m, ref[n]) for n in names}
+        Zn = np.stack([T.ref_at_points(ref[n], lat, lon) for n in names], 1)
+        Zc = np.stack([ref2[n][gj[k], gi[k]] for n in names], 1)
+        valid = np.all(np.isfinite(Zn), 1) & np.all(np.isfinite(Zc), 1)
+        tag_n, tag_c = f"{a.ref_name} @ gauge (native grid)", f"{a.ref_name} @ 2° cell (repr. floor)"
+        E[("reference", tag_n)] = np.where(valid, np.sum(np.abs(np.nan_to_num(Zn) - Zo) ** 2, 1), 0.0)
+        E[("reference", tag_c)] = np.where(valid, np.sum(np.abs(np.nan_to_num(Zc) - Zo) ** 2, 1), 0.0)
+        for tag, Zr in ((tag_n, Zn), (tag_c, Zc)):
+            ref_rows_pc[tag] = {n: T.rms_cm(Zr[valid, c], Zo[valid, c], w[valid]) for c, n in enumerate(names)}
+        ref_meta = dict(name=a.ref_name, files={n: ref[n]["file"] for n in names},
+                        unit_scale={n: ref[n]["scale"] for n in names}, n_valid=int(valid.sum()), n_total=len(k))
+        print(f"[benchmark] {a.ref_name}: {valid.sum()}/{len(k)} gauges have valid atlas values (native and 2° cell)")
+        if ref_rows_pc[tag_n].get("M2", 0) > 30:
+            print("[benchmark] WARNING: atlas M2 RMS at gauges > 30 cm — check units / phase convention of the atlas files")
+        del ref
+    else:
+        print(f"[benchmark] no reference atlas under {rdir} — reporting gauge strata only. To add EOT20: download the "
+              f"ocean-tide NetCDFs from https://doi.org/10.17882/79489 and unzip into {rdir}")
+    st = _strata(Hk, a.open_depth, valid)
+    gauge_rows = []
+    for (design, name), e in E.items():
+        gauge_rows.append(dict(design=design, name=name, **{s: _rms_sel(e, w, sel) for s, sel in st.items()},
+                               **{f"n_{s}": int(sel.sum()) for s, sel in st.items()}))
+    paired = {}
+    if ref_meta is not None:
+        floor = E[("reference", f"{a.ref_name} @ 2° cell (repr. floor)")]
+        for (design, name), e in E.items():
+            if design == "reference":
+                continue
+            paired[f"{design}:{name}"] = {s: T.paired_bootstrap(e[sel], floor[sel], w[sel]) for s, sel in st.items()
+                                          if sel.sum() > 5}
+    field_rows = []
+    if ref2 is not None:
+        A = np.broadcast_to(m.area_np[:, None], m.maskb.shape)
+        fin = np.all([np.isfinite(ref2[n]) for n in names], 0)
+        latc = np.abs(m.lat_np)[:, None]
+        regions = dict(deep=m.maskb & fin & (m.H_np >= a.open_depth) & (latc <= 66),
+                       shelf=m.maskb & fin & (m.H_np < 500) & (latc <= 66))
+
+        def field_rms(eta):
+            return {reg: {n: float(100 * np.sqrt(np.sum(A[s] * np.abs(eta[n][s] - ref2[n][s]) ** 2) / np.sum(A[s]) / 2))
+                          for n in names} for reg, s in regions.items()}
+
+        def pack(label, spec, per):
+            row = dict(label=label, spec=spec, n_folds=len(per))
+            for reg in regions:
+                rss = [math.sqrt(sum(p[reg][n] ** 2 for n in names)) for p in per]
+                row[reg] = {n: float(np.mean([p[reg][n] for p in per])) for n in names}
+                row[reg + "_rss"], row[reg + "_rss_sd"] = float(np.mean(rss)), float(np.std(rss))
+            return row
+
+        for r in Sh["rows"]:
+            per = []
+            for key in r["keys"]:
+                F = _fields(key)
+                if F is None or not all(f"eta_{n}" in F.files for n in names):
+                    continue
+                per.append(field_rms({n: F[f"eta_{n}"].astype(complex) for n in names}))
+            if per:
+                field_rows.append(pack(_short(r["spec"]), r["spec"], per))
+        field_rows.append(pack("equilibrium", "eq", [field_rms({n: m.equilibrium(n).numpy() for n in names})]))
+        print("[benchmark] model vs atlas, RSS [cm]:  " + "  ".join(
+            f"{fr['label']}: deep {fr['deep_rss']:.1f} / shelf {fr['shelf_rss']:.1f}" for fr in field_rows))
+    save("summary_benchmark.json", dict(gauge_rows=gauge_rows, field_rows=field_rows, paired_vs_floor=paired,
+                                        ref=ref_meta, ref_per_constituent=ref_rows_pc, open_depth=a.open_depth,
+                                        names=names))
+    print(f"\n==== gauge strata (open = snapped cell >= {a.open_depth:g} m) ====")
+    for r in gauge_rows:
+        print(f"{r['design']:9s} {r['name']:40s} all {r['all']:6.1f} (n={r['n_all']})  open {r['open']:6.1f} "
+              f"(n={r['n_open']})  coastal {r['coastal']:6.1f} (n={r['n_coastal']})")
+
+
 def exp_res(a):
     c_coarse, c_fine = get_ctx(a, a.res), get_ctx(a, a.res_fine)
     common = frozenset({r["id"] for r in c_coarse.g} & {r["id"] for r in c_fine.g})
@@ -332,6 +495,24 @@ def exp_res(a):
     save("summary_res.json", dict(rows=rows, n_common=len(common)))
 
 
+def exp_manifest(a):
+    ctx = get_ctx(a)
+    recs = [json.loads(f.read_text()) for f in RUNS.glob("*.json")]
+    ex = sorted(T.exclude_ids())
+    by_res = {}
+    for r in recs:
+        res = r.get("cfg", {}).get("res", a.res)
+        d = by_res.setdefault(str(res), dict(n_fits=0, fit_seconds=0.0))
+        d["n_fits"] += 1
+        d["fit_seconds"] += float(r.get("seconds", 0.0))
+    man = dict(env=T.env_info(), results_dir=str(T.RESULTS), n_gauges_built=len(ctx.g),
+               n_gauges_evaluated=len([r for r in ctx.g if int(r["id"]) not in set(ex)]), gauge_digest=ctx.gdig,
+               exclude_ids=ex, fits_by_resolution=by_res,
+               note="fit_seconds counts L-BFGS time only; wall-clock of `experiments.py all` also includes scoring/GP.")
+    save("manifest.json", man)
+    print(json.dumps(T._jsonable(man), indent=1))
+
+
 def _print_summary(S, title):
     print(f"\n==== {title} ====  Kendall tau(in, out) over NN widths = {S['kendall_in_vs_out']}")
     for r in S["rows"]:
@@ -339,7 +520,7 @@ def _print_summary(S, title):
         print(f"{r['label']:36s}{r['n_params']:7d}  in {r['in_mean']:5.1f}±{r['in_sd']:4.1f}  out {r['out_mean']:5.1f}±"
               f"{r['out_sd']:4.1f}  pooled {r['pooled']:5.1f}  GP {r['pooled_gp']:5.1f}  P(>=GP) {r['vs_gp']['p']:.3f}  "
               + (f"vs PHYS {vr['diff']:+.1f} [{vr['lo']:+.1f},{vr['hi']:+.1f}] wins {r['wins_vs_ref']}  " if vr else "")
-              + f"D {r['D']:.2f} TW shallow {100 * r['shallow']:.0f}%")
+              + f"D {r['D']:.2f} TW shallow {100 * r['shallow']:.0f}%  {r['sec_per_eval']:.2f} s/eval")
 
 
 # ============================================================================ figures & tables
@@ -383,6 +564,7 @@ def _short(spec):
     if p[0] == "phys": return "PHYS"
     if p[0] == "physfc": return "PHYS-fc"
     if p[0] == "poly": return f"POLY{p[1] if len(p) > 1 else 2}"
+    if p[0] == "eq": return "equilibrium"
     f = p[3] if len(p) > 3 else "H+slope+lat"
     return f"NN-{p[1] if len(p) > 1 else 16}" + ("" if f == "H+slope+lat" else f"[{f.replace('H+slope', 'Hs')}]")
 
@@ -404,6 +586,7 @@ def _tex(name, caption, label, header, rows, align=None, wide=True):
 
 
 pm = lambda m, s: f"${m:.1f}\\pm{s:.1f}$"
+f1 = lambda v: "--" if v is None or (isinstance(v, float) and not math.isfinite(v)) else f"{v:.1f}"
 
 
 def _map_ax(ax, lat, lon, Z, mask, cmap, vmin, vmax):
@@ -443,9 +626,10 @@ def fig_check():
     rows = [[_tex_label(r["spec_str"]) + (" + energy" if r.get("energy_penalty") else ""), r["n_params"],
              f"{r['energy']['M2']['D_TW']:.3f}", f"{abs(r['energy']['M2']['rel_mismatch']):.1e}",
              f"{abs(r['energy']['K1']['rel_mismatch']):.1e}", f"{r['energy']['M2']['solver_resid']:.1e}",
-             f"{max(d['rel'] for d in r['grad']):.1e}", f"{r['seconds_loss_and_grad']:.1f}"] for r in C]
+             f"{max(d['rel'] for d in r['grad']):.1e}", f"{r['seconds_loss_and_grad']:.2f}"] for r in C]
     _tex("tab_check", "Verification at initial parameters: discrete energy identity, solver residual and adjoint "
-         "gradient check (central FD, $h=10^{-3}$).", "tab:check",
+         "gradient check (central FD, $h=10^{-3}$). Timing: median of three loss+gradient evaluations (M$_2$, K$_1$) "
+         "after one warm-up.", "tab:check",
          ["closure", "\\#p", "$D_{M_2}$ [TW]", "$|W-D|/W$ $M_2$", "$K_1$", "$\\|A x-b\\|/\\|b\\|$", "max grad err",
           "loss+grad [s]"], rows, wide=False)
 
@@ -489,8 +673,9 @@ def fig_capacity(Sh, Sb):
         lad = [R[s] for s in ["phys", "poly:2"] + FAMILY if s in R]
         a2.plot([r["n_params"] for r in lad], [r["gap_mean"] for r in lad], ls=ls, marker="o", ms=3, color="#D55E00",
                 label=tag)
-        _dat(f"capacity_{tag}", ["n", "in", "in_sd", "out", "out_sd", "gap"],
-             [(r["n_params"], r["in_mean"], r["in_sd"], r["out_mean"], r["out_sd"], r["gap_mean"]) for r in lad])
+        _dat(f"capacity_{tag}", ["n", "in", "in_sd", "out", "out_sd", "gap", "sec_per_eval"],
+             [(r["n_params"], r["in_mean"], r["in_sd"], r["out_mean"], r["out_sd"], r["gap_mean"],
+               r.get("sec_per_eval", float("nan"))) for r in lad])
     a1.set_xscale("log"); a1.set_ylabel("RMS [cm]"); a1.legend(ncol=2, loc="upper right")
     a2.set_ylabel("gap [cm]"); a2.set_xlabel("trainable parameters"); a2.axhline(0, c="k", lw=0.5); a2.legend()
     _save(fig, "fig_capacity")
@@ -679,6 +864,53 @@ def fig_energy(E):
            f"{100 * r['shallow']:.0f}"] for r in E["rows"]], wide=False)
 
 
+def tab_ablation(Ab):
+    if not Ab: return
+    od = Ab.get("open_depth", 1000)
+    _tex("tab_ablation", "Energy-penalty ablation (hash CV, fold means). With the $D_{M_2}$ target only "
+         "($\\mu_D=1$, $\\mu_{\\rm sh}=0$) the shelf share $f_{\\rm sh}$ is not optimised and is an independent "
+         "outcome; with both targets it is partly imposed by construction. Open/coastal: pooled held-out RMS at "
+         f"gauges whose 2° cell is deeper/shallower than {od:g}\\,m.", "tab:ablation",
+         ["closure", "penalty", "held-out [cm]", "$D_{M_2}$ [TW]", "$f_{\\rm sh}$ [\\%]", "open [cm]", "coastal [cm]"],
+         [[_tex_label(r["spec"]), r["penalty"], pm(r["out_mean"], r["out_sd"]), f"{r['D']:.2f}",
+           f"${100 * r['shallow']:.0f}\\pm{100 * r['shallow_sd']:.0f}$", f1(r["open"]), f1(r["coastal"])]
+          for r in Ab["rows"]], wide=False)
+
+
+def fig_benchmark(B):
+    if not B: return
+    rows = B["gauge_rows"]
+    od = B.get("open_depth", 1000)
+    _tex("tab_benchmark", "Pooled held-out RMS (RSS over the fitted constituents, cm) by gauge class. Open: snapped "
+         f"2° cell deeper than {od:g}\\,m; coastal: shallower. Reference rows: external atlas at the gauge (native "
+         "grid) and block-averaged onto the 2° grid and read through the same gauge operator, i.e.\\ the error floor "
+         "of a perfect 2° model.", "tab:benchmark",
+         ["design", "model", "all", "open", "coastal", "$n$ (all/open/coastal)"],
+         [[r["design"], r["name"].replace("_", "\\_"), f1(r["all"]), f1(r["open"]), f1(r["coastal"]),
+           f"{r['n_all']}/{r['n_open']}/{r['n_coastal']}"] for r in rows], wide=False)
+    if B.get("field_rows"):
+        names = B["names"]
+        _tex("tab_benchmark_field", f"Model vs.\\ {B['ref']['name']} block-averaged to 2°: area-weighted RMS (cm) "
+             f"over deep-ocean cells ($H\\ge{od:g}$\\,m, $|\\varphi|\\le66^\\circ$) and shelf cells ($H<500$\\,m); "
+             "hash-CV fold means.", "tab:benchmark_field",
+             ["model"] + [f"${n[0]}_{n[1]}$ deep" for n in names] + ["RSS deep", "RSS shelf"],
+             [[fr["label"]] + [f"{fr['deep'][n]:.1f}" for n in names] + [pm(fr["deep_rss"], fr["deep_rss_sd"]),
+                                                                          pm(fr["shelf_rss"], fr["shelf_rss_sd"])]
+              for fr in B["field_rows"]])
+    plt = _plt()
+    sel = [r for r in rows if r["design"] in ("hash", "reference") and r["name"] != "equilibrium"]
+    groups = ["all", "open", "coastal"]
+    x, wb = np.arange(len(groups)), 0.8 / max(len(sel), 1)
+    fig, ax = plt.subplots(figsize=(W1, 2.1))
+    pal = ["#7F7F7F", "#0072B2", "#CC79A7", "#E69F00", "#A06A00", "#5A3C00", "#D55E00", "#009E73", "#56B4E9", "#000000"]
+    for k, r in enumerate(sel):
+        ax.bar(x + (k - len(sel) / 2 + 0.5) * wb, [r[gname] for gname in groups], wb, color=pal[k % len(pal)],
+               label=r["name"], hatch="///" if r["design"] == "reference" else None, edgecolor="w", lw=0)
+    ax.set_xticks(x); ax.set_xticklabels([f"{gname} (n={sel[0]['n_' + gname]})" for gname in groups])
+    ax.set_ylabel("held-out RMS [cm]"); ax.legend(fontsize=5, ncol=2)
+    _save(fig, "fig_benchmark")
+
+
 def fig_distill(Dd):
     if not Dd: return
     plt = _plt()
@@ -756,13 +988,14 @@ def tab_cv(S, name, caption, label):
                      pm(r["out_mean"], r["out_sd"]), f"{r['gap_mean']:+.1f}", f"{r['pooled']:.1f}",
                      f"${vr['diff']:+.1f}\\ [{vr['lo']:+.1f},{vr['hi']:+.1f}]$" if vr else "--",
                      f"{r['wins_vs_ref']}/{r['n_folds']}" if vr else "--", f"{r['vs_gp']['p']:.3f}",
-                     f"{r['D']:.2f}", f"{100 * r['shallow']:.0f}"])
+                     f"{r['D']:.2f}", f"{100 * r['shallow']:.0f}", f"{r.get('sec_per_eval', float('nan')):.2f}"])
     r0 = S["rows"][0]
     cap = (caption + f" GP {pm(r0['gp_mean'], r0['gp_sd'])}, nearest {pm(r0['nearest_mean'], r0['nearest_sd'])}, "
            f"equilibrium {r0['pooled_eq']:.1f} (pooled). Kendall $\\tau$ (in-sample vs held-out, NN widths) = "
-           f"{S['kendall_in_vs_out'] if S['kendall_in_vs_out'] is not None else 'n/a'}.")
+           f"{S['kendall_in_vs_out'] if S['kendall_in_vs_out'] is not None else 'n/a'}. Last column: wall-clock "
+           "seconds per loss+gradient evaluation during fitting.")
     _tex(name, cap, label, ["closure", "\\#p", "in-sample", "held-out", "gap", "pooled", "$\\Delta$ vs PHYS [95\\% CI]",
-                            "wins", "$P(\\ge$GP)", "$D_{M_2}$", "shelf\\%"], rows)
+                            "wins", "$P(\\ge$GP)", "$D_{M_2}$", "shelf\\%", "s/eval"], rows)
     names = list(S["rows"][0]["out_row"])
     _tex(name + "_perconst", caption.split(".")[0] + ": held-out RMS per constituent (cm).", label + "pc",
          ["closure"] + [f"${n[0]}_{n[1]}$" for n in names],
@@ -784,8 +1017,9 @@ def exp_figures(a):
         jobs += [lambda: fig_block(Sh, Sb), lambda: fig_block_map(Sb),
                  lambda: tab_cv(Sb, "tab_block", "Spatial-block CV (k-means blocks).", "tab:block")]
     jobs += [lambda: fig_reg(load("summary_reg.json")), lambda: fig_transfer(load("summary_transfer.json")),
-             lambda: fig_energy(load("summary_energy.json")), lambda: fig_distill(load("summary_distill.json")),
-             fig_slr, lambda: fig_res(load("summary_res.json"))]
+             lambda: fig_energy(load("summary_energy.json")), lambda: tab_ablation(load("summary_ablation.json")),
+             lambda: fig_distill(load("summary_distill.json")), fig_slr,
+             lambda: fig_benchmark(load("summary_benchmark.json")), lambda: fig_res(load("summary_res.json"))]
     for j in jobs:
         try:
             j()
@@ -794,7 +1028,8 @@ def exp_figures(a):
 
 
 EXPS = dict(check=exp_check, cv=exp_cv, block=exp_block, reg=exp_reg, transfer=exp_transfer, energy=exp_energy,
-            distill=exp_distill, slr=exp_slr, res=exp_res, figures=exp_figures)
+            ablation=exp_ablation, distill=exp_distill, slr=exp_slr, benchmark=exp_benchmark, res=exp_res,
+            manifest=exp_manifest, figures=exp_figures)
 
 
 def main():
@@ -812,20 +1047,29 @@ def main():
     ap.add_argument("--l2-phys", type=float, default=1e-3, help="prior weight for PHYS log-parameters")
     ap.add_argument("--buffer-km", type=float, default=0.0, help="spatial-block CV buffer")
     ap.add_argument("--slr", type=float, default=1.0, help="uniform sea-level rise for E7 [m]")
+    ap.add_argument("--ref-dir", default=str(T.CACHE / "ref" / "EOT20"),
+                    help="directory with reference-atlas NetCDFs (one per constituent) for `benchmark`")
+    ap.add_argument("--ref-name", default="EOT20", help="label of the reference atlas in tables")
+    ap.add_argument("--open-depth", type=float, default=1000.0, help="open-ocean gauge: snapped cell deeper than this [m]")
+    ap.add_argument("--threads", type=int, default=None, help="torch CPU threads (for reproducible timings)")
     ap.add_argument("--quick", action="store_true", help="smoke test: 2 folds, <=8 L-BFGS iterations")
     ap.add_argument("--skip-res", action="store_true", help="skip the expensive 1° run in 'all'")
     a = ap.parse_args()
     if a.quick:
         a.iters = min(a.iters, 8)
+    if a.threads:
+        torch.set_num_threads(a.threads)
     for d in (T.CACHE, T.RESULTS, RUNS, FIELDS, FIGS, TABS):
         d.mkdir(parents=True, exist_ok=True)
     todo = list(EXPS) if a.exp == "all" else [a.exp]
+    t_all = time.time()
     for e in todo:
         if e == "res" and a.exp == "all" and a.skip_res:
             continue
         t0 = time.time()
         EXPS[e](a)
         print(f"[{e}] finished in {(time.time() - t0) / 60:.1f} min\n")
+    print(f"[all] total wall-clock {(time.time() - t_all) / 60:.1f} min")
 
 
 if __name__ == "__main__":

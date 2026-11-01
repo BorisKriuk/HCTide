@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tide.py — differentiable global barotropic tide model with hard-constrained, learnable dissipation
+tide.py — HCTide: differentiable global barotropic tide model with hard-constrained, learnable dissipation
           closures. Library for experiments.py plus a small CLI.
 
 Physics: frequency-domain linearised Laplace tidal equations on a lat/lon Arakawa C-grid
@@ -8,10 +8,10 @@ Physics: frequency-domain linearised Laplace tidal equations on a lat/lon Arakaw
     Phi = (1 - beta) eta - eta_eq,   eta_eq = gamma_k A_k P_m(lat) e^{i m lon},   kappa = r_eff / H [1/s].
   The coupled (u, v, eta) system A(theta) x = b is solved by sparse LU. Coriolis uses shared corner weights
   and grad/div are summation-by-parts, so  work input == dissipation  holds to round-off for every theta,
-  and r_eff > 0 makes A(theta) non-singular for every theta.
+  and kappa >= kappa_min > 0 makes A(theta) non-singular for every theta.
 Learning: only the drag field r_eff(x; theta) > 0 and the scalar SAL factor beta are learned. Gradients come
   from the implicit-function adjoint, which reuses the forward LU (one back-substitution per constituent,
-  independent of dim theta).
+  independent of dim theta). No PDE residual enters the loss: the PDE is solved, not penalised.
 
 Closures (spec strings)
   phys                PHYS(4p):  kappa = r0/H + r_sh/H e^{-H/200} + c_it |grad H|^2 sig((H-500)/100) + kappa_min
@@ -23,7 +23,11 @@ Closures (spec strings)
 Loss: density-weighted complex misfit summed over fitted constituents + l2 * penalty (+ optional energy
   penalty  mu_D (D_M2/2.4TW - 1)^2 + mu_sh (shallow fraction - 2/3)^2 ).
 Validation: hash folds (random w.r.t. space) or spatial blocks (k-means on the sphere, optional buffer),
-  data-only GP / nearest-gauge / equilibrium baselines, paired bootstrap.
+  data-only GP / nearest-gauge / equilibrium baselines, paired bootstrap; optional external reference atlas
+  (EOT20 / FES / TPXO NetCDF) for benchmarking.
+
+Conventions: Greenwich phase lag G, complex amplitude Z = |Z| e^{-iG}, eta(t) = f Re[Z e^{i(V+u)}],
+  Doodson arguments with tau = T + h - s, T = 15 deg x UT hours (Schureman/Pugh), standard phase offsets.
 
     python tide.py check [--synthetic] [--closure nn:8] [--energy-mu 0.1]
     python tide.py fit   --closure nn:8 [--fold 0] [--scheme hash|block]
@@ -31,23 +35,28 @@ Validation: hash folds (random w.r.t. space) or spatial blocks (k-means on the s
     python tide.py predict --lat 21.3 --lon 202.1 --start 2024-06-01 --hours 240
     python tide.py split [--scheme block]
   Every experiment in the paper:  python experiments.py all
+  Results directory can be redirected with the environment variable HCTIDE_RESULTS (default ./results).
 
-Deps: numpy scipy torch requests  (+ matplotlib for experiments.py)
+Deps: numpy scipy torch requests  (+ matplotlib for experiments.py; + xarray netCDF4 for reference atlases)
 """
-import argparse, csv, hashlib, io, itertools, json, math, sys, time
+import argparse, csv, hashlib, io, itertools, json, math, os, platform, re, subprocess, sys, time
 from pathlib import Path
 from urllib.parse import quote
 
 import numpy as np
+import scipy
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import torch
 import requests
 
+__version__ = "1.1.0"
+
 torch.set_default_dtype(torch.float64)
 CPLX = torch.complex128
 ROOT = Path(__file__).resolve().parent
-CACHE, RESULTS = ROOT / "cache", ROOT / "results"
+CACHE = ROOT / "cache"
+RESULTS = Path(os.environ.get("HCTIDE_RESULTS", str(ROOT / "results"))).resolve()
 
 # ----------------------------------------------------------------------------- constants
 R_E, G0, OMEGA_E, RHO = 6.371e6, 9.81, 7.292115e-5, 1035.0
@@ -62,19 +71,21 @@ FEATS = ("H", "slope", "lat", "abslat", "fw")
 UHSLC = "https://uhslc.soest.hawaii.edu/erddap/tabledap/global_hourly_fast.csv"
 ETOPO = "https://coastwatch.pfeg.noaa.gov/erddap/griddap/etopo180.csv"
 
+# name: (Doodson numbers on (tau, s, h, p, N, p'), phase offset [deg], equilibrium amplitude [m], species)
+# Standard Schureman/Pugh offsets (diurnal K1/J1/OO1 +90, O1/P1/Q1 -90) with tau = T + h - s, T from 00 UT.
 CONST = {
     "M2": ((2, 0, 0, 0, 0, 0), 0, 0.242334, 2),
     "S2": ((2, 2, -2, 0, 0, 0), 0, 0.112841, 2),
     "N2": ((2, -1, 0, 1, 0, 0), 0, 0.046398, 2),
     "K2": ((2, 2, 0, 0, 0, 0), 0, 0.030704, 2),
-    "K1": ((1, 1, 0, 0, 0, 0), -90, 0.141565, 1),
-    "O1": ((1, -1, 0, 0, 0, 0), 90, 0.100514, 1),
-    "P1": ((1, 1, -2, 0, 0, 0), 90, 0.046843, 1),
-    "Q1": ((1, -2, 0, 1, 0, 0), 90, 0.019256, 1),
+    "K1": ((1, 1, 0, 0, 0, 0), 90, 0.141565, 1),
+    "O1": ((1, -1, 0, 0, 0, 0), -90, 0.100514, 1),
+    "P1": ((1, 1, -2, 0, 0, 0), -90, 0.046843, 1),
+    "Q1": ((1, -2, 0, 1, 0, 0), -90, 0.019256, 1),
     "2N2": ((2, -2, 0, 2, 0, 0), 0, 0, 2), "MU2": ((2, -2, 2, 0, 0, 0), 0, 0, 2),
     "NU2": ((2, -1, 2, -1, 0, 0), 0, 0, 2), "L2": ((2, 1, 0, -1, 0, 0), 180, 0, 2),
-    "T2": ((2, 2, -3, 0, 0, 1), 0, 0, 2), "J1": ((1, 2, 0, -1, 0, 0), -90, 0, 1),
-    "OO1": ((1, 3, 0, 0, 0, 0), -90, 0, 1), "M4": ((4, 0, 0, 0, 0, 0), 0, 0, 4),
+    "T2": ((2, 2, -3, 0, 0, 1), 0, 0, 2), "J1": ((1, 2, 0, -1, 0, 0), 90, 0, 1),
+    "OO1": ((1, 3, 0, 0, 0, 0), 90, 0, 1), "M4": ((4, 0, 0, 0, 0, 0), 0, 0, 4),
     "MS4": ((4, 2, -2, 0, 0, 0), 0, 0, 4), "Mf": ((0, 2, 0, 0, 0, 0), 0, 0, 0),
     "Mm": ((0, 1, 0, -1, 0, 0), 0, 0, 0), "Ssa": ((0, 0, 2, 0, 0, 0), 0, 0, 0),
 }
@@ -103,14 +114,36 @@ def _jsonable(x):
         return int(x)
     if isinstance(x, np.floating):
         return float(x)
+    if isinstance(x, complex):
+        return [x.real, x.imag]
     if torch.is_tensor(x):
         return _jsonable(x.detach().numpy())
     return x
 
 
+def env_info():
+    """Software / hardware provenance, stored with every saved result."""
+    def sh(cmd):
+        try:
+            return subprocess.check_output(cmd, cwd=ROOT, stderr=subprocess.DEVNULL).decode().strip() or None
+        except Exception:
+            return None
+    cpu = sh(["sysctl", "-n", "machdep.cpu.brand_string"]) if sys.platform == "darwin" else None
+    if cpu is None and Path("/proc/cpuinfo").exists():
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                cpu = line.split(":", 1)[1].strip()
+                break
+    return dict(hctide=__version__, python=platform.python_version(), numpy=np.__version__, scipy=scipy.__version__,
+                torch=torch.__version__, platform=platform.platform(), cpu=cpu or platform.processor() or platform.machine(),
+                torch_threads=torch.get_num_threads(), git_commit=sh(["git", "rev-parse", "--short", "HEAD"]),
+                git_dirty=bool(sh(["git", "status", "--porcelain"])))
+
+
 # ----------------------------------------------------------------------------- astronomy
 def astro(t):
-    """Mean longitudes (deg) at times t (datetime64). Returns (..., 6): tau, s, h, p, N, p'."""
+    """Doodson mean longitudes (deg) at times t (datetime64[UT]). Returns (..., 6): tau, s, h, p, N, p'.
+    tau = T + h - s with T = 15 deg x hours since 00 UT (mean solar angle from lower transit)."""
     jd = (t - np.datetime64("2000-01-01T12:00:00")) / np.timedelta64(1, "s") / 86400.0
     T = jd / 36525.0
     s = 218.3164477 + 481267.88123421 * T
@@ -118,7 +151,7 @@ def astro(t):
     p = 83.3532465 + 4069.0137287 * T
     N = 125.04452 - 1934.136261 * T
     pp = 282.93735 + 1.71946 * T
-    tau = (jd % 1.0) * 360.0 - s + h
+    tau = ((jd + 0.5) % 1.0) * 360.0 - s + h
     return np.stack([tau, s, h, p, N, pp], -1) % 360.0
 
 
@@ -183,22 +216,31 @@ def predict_series(Z, t):
 
 
 # ----------------------------------------------------------------------------- data fetch
-def http_text(url, tries=3):
+NET_FAILURES = []             # station ids whose download failed for network reasons (never cached)
+
+
+def http_get(url, tries=3):
+    """Returns (status, text) with status 'ok' | 'missing' (HTTP 404: ERDDAP 'no matching results') | 'error'."""
     for k in range(tries):
         try:
             r = requests.get(url, timeout=300)
             if r.status_code == 200:
-                return r.text
+                return "ok", r.text
             if r.status_code == 404:
-                return None
+                return "missing", None
         except requests.RequestException:
             pass
         time.sleep(3 * (k + 1))
-    return None
+    return "error", None
+
+
+def http_text(url, tries=3):
+    return http_get(url, tries)[1]
 
 
 def load_bathymetry(res):
-    """ETOPO1 block-averaged to res-degree grid. Returns (lat centres, lon centres 0..360, depth H>0 [m])."""
+    """ETOPO1 sampled every 30 arc-min (0.5°) via ERDDAP, then block-averaged to a res-degree grid.
+    Returns (lat centres, lon centres 0..360, depth H>0 [m])."""
     CACHE.mkdir(exist_ok=True)
     f = CACHE / f"etopo_H_{res:g}deg.npz"
     if f.exists():
@@ -253,15 +295,21 @@ def uhslc_stations():
 
 
 def uhslc_hourly(sid, year):
+    """Hourly sea level [m]. Genuinely missing records are cached as empty; network failures are NOT cached."""
     f = CACHE / f"uhslc_{sid}_{year}.npz"
+    empty = (np.array([], dtype="datetime64[s]"), np.array([]))
     if f.exists():
         d = np.load(f)
         return d["t"], d["eta"]
     q = f"time,sea_level&uhslc_id={sid}&time>={year}-01-01T00:00:00Z&time<{year + 1}-01-01T00:00:00Z"
-    txt = http_text(f"{UHSLC}?{quote(q, safe='=&,:')}")
-    if txt is None:
-        np.savez(f, t=np.array([], dtype="datetime64[s]"), eta=np.array([]))
-        return np.array([], dtype="datetime64[s]"), np.array([])
+    status, txt = http_get(f"{UHSLC}?{quote(q, safe='=&,:')}")
+    if status == "error":
+        NET_FAILURES.append(int(sid))
+        print(f"  [uhslc] station {sid}: network failure (not cached; will retry next run)")
+        return empty
+    if status == "missing" or not txt:
+        np.savez(f, t=empty[0], eta=empty[1])
+        return empty
     ts, vs = [], []
     for line in txt.strip().splitlines()[2:]:
         a, b = line.split(",")[:2]
@@ -273,6 +321,136 @@ def uhslc_hourly(sid, year):
     eta = eta[idx]
     np.savez(f, t=t, eta=eta)
     return t, eta
+
+
+# ----------------------------------------------------------------------------- reference atlases (benchmark only)
+def _nc_open(path):
+    try:
+        import xarray as xr
+    except ImportError as e:
+        raise RuntimeError("reading reference atlases needs:  pip install xarray netCDF4") from e
+    return xr.open_dataset(path, decode_times=False, mask_and_scale=True)
+
+
+def _pick(ds, cands, contains=(), avoid=()):
+    names = list(ds.variables)
+    low = {v.lower(): v for v in names}
+    for c in cands:
+        if c in low:
+            return low[c]
+    for v in names:
+        lv = v.lower()
+        if contains and any(s in lv for s in contains) and not any(s in lv for s in avoid):
+            return v
+    return None
+
+
+def _unit_scale(units, sample, fallback=None):
+    u = str(units or "").strip().lower()
+    if u in ("cm", "centimeter", "centimeters", "centimetre", "centimetres"):
+        return 1e-2
+    if u in ("mm", "millimeter", "millimeters", "millimetre", "millimetres"):
+        return 1e-3
+    if u in ("m", "meter", "meters", "metre", "metres"):
+        return 1.0
+    if fallback is not None:
+        return fallback
+    med = float(np.nanmedian(np.abs(sample)))     # heuristic on M2: m ~0.3-0.5, cm ~30-50, mm ~300-500
+    return 1.0 if med < 3 else (1e-2 if med < 150 else 1e-3)
+
+
+def load_reference_atlas(path, names):
+    """Load a gridded tide atlas (one NetCDF per constituent; EOT20 / FES2014 / TPXO-atlas style) as
+    {name: dict(lat, lon, Z [m, complex, NaN on land], file, scale)} with Z = A e^{-iG} (Greenwich phase lag)."""
+    path = Path(path)
+    files = sorted(path.rglob("*.nc")) if path.is_dir() else [path]
+    if not files:
+        raise FileNotFoundError(f"no .nc files under {path}")
+    out, m2_scale = {}, None
+    for n in sorted(names, key=lambda x: x != "M2"):
+        cand = [f for f in files if n.lower() in re.split(r"[^0-9a-z]+", f.stem.lower())]
+        cand = [f for f in cand if "load" not in f.stem.lower()] or cand
+        if not cand:
+            raise FileNotFoundError(f"no reference file for {n} under {path}")
+        f = sorted(cand, key=lambda x: ("ocean" not in x.stem.lower(), len(x.name)))[0]
+        ds = _nc_open(f)
+        vlat = _pick(ds, ["lat", "latitude", "lat_z", "nav_lat", "y"])
+        vlon = _pick(ds, ["lon", "longitude", "lon_z", "nav_lon", "x"])
+        if vlat is None or vlon is None:
+            raise ValueError(f"{f}: cannot find lat/lon variables in {list(ds.variables)}")
+        la = np.asarray(ds[vlat].values, float).ravel()
+        lo = np.asarray(ds[vlon].values, float).ravel()
+        va = _pick(ds, ["amplitude", "amp", "ham", "h_amp"], contains=("amplitude",))
+        vp = _pick(ds, ["phase", "pha", "hph", "h_pha"], contains=("phase",))
+        if va is not None and vp is not None:
+            Am = np.asarray(ds[va].values, float).squeeze()
+            Ph = np.asarray(ds[vp].values, float).squeeze()
+            sc = _unit_scale(ds[va].attrs.get("units"), Am, m2_scale)
+            rad = "rad" in str(ds[vp].attrs.get("units", "")).lower()
+            Z = sc * Am * np.exp(-1j * (Ph if rad else np.radians(Ph)))
+        else:
+            vr = _pick(ds, ["hre", "real", "re"], contains=("real",))
+            vi = _pick(ds, ["him", "imag", "im"], contains=("imag",))
+            if vr is None or vi is None:
+                raise ValueError(f"{f}: no amplitude/phase or real/imag variables in {list(ds.variables)}")
+            Zr = np.asarray(ds[vr].values, float).squeeze() + 1j * np.asarray(ds[vi].values, float).squeeze()
+            sc = _unit_scale(ds[vr].attrs.get("units"), np.abs(Zr), m2_scale)
+            Z = sc * Zr
+        ds.close()
+        if Z.shape == (len(lo), len(la)) and Z.shape != (len(la), len(lo)):
+            Z = Z.T
+        if Z.shape != (len(la), len(lo)):
+            raise ValueError(f"{f}: field shape {Z.shape} does not match lat {len(la)} x lon {len(lo)}")
+        Z = np.where(np.isfinite(Z) & (np.abs(Z) > 0), Z, np.nan + 0j)
+        lo = lo % 360.0
+        order = np.argsort(lo, kind="stable")
+        lo, Z = lo[order], Z[:, order]
+        keep = np.concatenate([[True], np.diff(lo) > 1e-9])
+        lo, Z = lo[keep], Z[:, keep]
+        if la[0] > la[-1]:
+            la, Z = la[::-1], Z[::-1]
+        if n == "M2":
+            m2_scale = sc
+        out[n] = dict(lat=la, lon=lo, Z=Z.astype(np.complex64), file=str(f), scale=sc)
+        med = np.nanmedian(np.abs(Z)) * 100
+        print(f"[ref] {n}: {f.name}  grid {len(la)}x{len(lo)}  unit scale {sc:g}  median amp {med:.1f} cm")
+    return out
+
+
+def ref_to_mesh(m, R):
+    """Area-weighted complex block average of a reference atlas onto the model grid (NaN where no data)."""
+    LON, LAT = np.meshgrid(R["lon"], R["lat"])
+    ok = np.isfinite(R["Z"])
+    la, lo, z = LAT[ok], LON[ok], R["Z"][ok].astype(complex)
+    j = np.clip(((la + 90) / m.res).astype(int), 0, m.nlat - 1)
+    i = (lo / m.res).astype(int) % m.nlon
+    wgt = np.cos(np.radians(la))
+    num, den = np.zeros((m.nlat, m.nlon), complex), np.zeros((m.nlat, m.nlon))
+    np.add.at(num, (j, i), wgt * z)
+    np.add.at(den, (j, i), wgt)
+    return np.where(den > 0, num / np.maximum(den, 1e-300), np.nan + 0j)
+
+
+def ref_at_points(R, lats, lons, max_km=60.0):
+    """Nearest valid atlas node within max_km of each point (NaN if none)."""
+    la, lo, Z = R["lat"], R["lon"], R["Z"]
+    k = int(math.ceil(0.6 / max(abs(la[1] - la[0]), 1e-6))) + 1
+    out = np.full(len(lats), np.nan + 0j)
+    for q, (p_la, p_lo) in enumerate(zip(lats, lons)):
+        j0, i0 = np.searchsorted(la, p_la), np.searchsorted(lo, p_lo % 360.0)
+        js = np.arange(j0 - k, j0 + k + 1)
+        js = js[(js >= 0) & (js < len(la))]
+        is_ = np.arange(i0 - k, i0 + k + 1) % len(lo)
+        sub = Z[np.ix_(js, is_)]
+        ok = np.isfinite(sub)
+        if not ok.any():
+            continue
+        D = gc_km(p_la, p_lo, la[js][:, None], lo[is_][None, :])
+        D = np.where(ok, D, np.inf)
+        a = np.argmin(D)
+        if D.flat[a] <= max_km:
+            out[q] = sub.flat[a]
+    return out
 
 
 # ----------------------------------------------------------------------------- mesh
@@ -439,8 +617,8 @@ class PhysClosure:
 class NNClosure:
     """kappa = r(x)/H + kappa_min, r = 1e-3 exp(6 tanh(MLP(x)/6)) m/s, tanh hidden layers.
     theta = [W1, b1, ..., W_out, b_out, logit(beta/0.2)]. Output layer initialised ~0 -> r = 1e-3 m/s.
-    Penalty: weight decay on weight matrices only (biases and beta unpenalised)."""
-    l2_default = 1e-4
+    Penalty: weight decay on weight matrices only (biases and beta unpenalised). Default lambda = 1e-6 (paper E1)."""
+    l2_default = 1e-6
 
     def __init__(self, width=16, depth=2, feats=("H", "slope", "lat")):
         self.width, self.depth, self.feats = int(width), int(depth), tuple(feats)
@@ -494,7 +672,7 @@ class NNClosure:
 class PolyClosure:
     """h(x) = polynomial of total degree <= deg in the features; r = 1e-3 exp(6 tanh(h/6)) as for NN.
     Used as a low-capacity learnable closure and as the target of NN distillation."""
-    l2_default = 1e-4
+    l2_default = 1e-6
 
     def __init__(self, degree=2, feats=("H", "slope", "lat")):
         self.degree, self.feats = int(degree), tuple(feats)
@@ -698,6 +876,7 @@ def build_gauges(m, year, max_gauges):
         return g
     names = list(CONST)
     out = []
+    NET_FAILURES.clear()
     stations = sorted(uhslc_stations(), key=lambda s: s["id"])
     print(f"[gauges] {len(stations)} UHSLC stations; analysing year {year} ...")
     for s in stations:
@@ -718,7 +897,11 @@ def build_gauges(m, year, max_gauges):
         print(f"  {len(out):3d} {s['id']:4d} {s['name'][:22]:22s} M2={abs(zm[0]):.2f} m  resid={rstd:.3f} m", flush=True)
         if len(out) >= max_gauges:
             break
-    f.write_text(json.dumps(out))
+    if NET_FAILURES:
+        print(f"[gauges] WARNING: {len(NET_FAILURES)} stations failed to download ({NET_FAILURES[:10]}...). "
+              f"Gauge set NOT cached; rerun to retry.")
+    else:
+        f.write_text(json.dumps(out))
     for r in out:
         r["Z"] = np.array(r["Zr"]) + 1j * np.array(r["Zi"])
     return out
@@ -732,9 +915,21 @@ def density_weights(g, radius_km=500.0):
     return w / w.mean()
 
 
+EXCLUDE_FILES = (ROOT / "exclude_ids.json", RESULTS / "exclude_ids.json")
+_EXCL_WARNED = []
+
+
 def exclude_ids():
-    f = RESULTS / "exclude_ids.json"
-    return set(json.loads(f.read_text())) if f.exists() else set()
+    """Fixed gauge exclusion list. Searched in the repo root first (commit it!), then in the results dir.
+    Accepts a JSON list of ids or {"ids": [...], "reason": ...}."""
+    for f in EXCLUDE_FILES:
+        if f.exists():
+            d = json.loads(f.read_text())
+            return set(int(i) for i in (d["ids"] if isinstance(d, dict) else d))
+    if not _EXCL_WARNED:
+        print("[split] WARNING: no exclude_ids.json found (repo root or results dir); using all gauges")
+        _EXCL_WARNED.append(1)
+    return set()
 
 
 def fold_of(sid, seed, k):
@@ -964,8 +1159,9 @@ def fit_theta(m, C, g, tr, names, w, theta0, l2, iters, fixed=None, energy=None,
     return dict(theta=best[1], loss=best[0], n_evals=len(hist), seconds=sec, history=hist)
 
 
-def run_check(m, C, g, names=("M2", "K1"), energy=None, seed=0, h=1e-3):
-    """Energy identity per constituent + adjoint vs central finite differences (directional if many params)."""
+def run_check(m, C, g, names=("M2", "K1"), energy=None, seed=0, h=1e-3, reps=3):
+    """Energy identity per constituent + adjoint vs central finite differences (directional if many params).
+    Timing: one warm-up evaluation, then the median of `reps` timed loss+gradient evaluations."""
     names = list(names)
     th0 = C.theta0(seed)
     if C.n > 6:                                  # move off the near-zero output layer so all paths are active
@@ -976,12 +1172,16 @@ def run_check(m, C, g, names=("M2", "K1"), energy=None, seed=0, h=1e-3):
         eb[n] = dict(P_TW=e["P"] / 1e12, D_TW=e["D"] / 1e12, rel_mismatch=(e["P"] - e["D"]) / max(abs(e["P"]), 1e-30),
                      shallow_frac=e["D_shallow"] / max(e["D"], 1e-30), solver_resid=m.last_resid)
     idx, w = np.arange(len(g)), density_weights(g)
-    theta = torch.tensor(th0, requires_grad=True)
-    t0 = time.time()
-    L = objective(m, C, theta, g, idx, names, w, energy=energy)
-    L.backward()
-    t_grad = time.time() - t0
-    grad = theta.grad.numpy().copy()
+    times, grad, L = [], None, None
+    for rep in range(reps + 1):
+        theta = torch.tensor(th0, requires_grad=True)
+        t0 = time.time()
+        L = objective(m, C, theta, g, idx, names, w, energy=energy)
+        L.backward()
+        if rep > 0:
+            times.append(time.time() - t0)
+        grad = theta.grad.numpy().copy()
+    t_grad = float(np.median(times))
     if C.n <= 6:
         dirs, labels = np.eye(C.n), list(C.names)
     else:
@@ -996,7 +1196,7 @@ def run_check(m, C, g, names=("M2", "K1"), energy=None, seed=0, h=1e-3):
         fd, ad = (fp - fm) / (2 * h), float(grad @ d)
         rows.append(dict(label=lab, adjoint=ad, fd=fd, rel=abs(fd - ad) / max(abs(fd), abs(ad), 1e-30)))
     return dict(label=C.label, spec=C.spec, n_params=C.n, energy=eb, loss=L.item(), grad=rows,
-                seconds_loss_and_grad=t_grad, energy_penalty=energy, n_gauges=len(g))
+                seconds_loss_and_grad=t_grad, seconds_all=times, energy_penalty=energy, n_gauges=len(g))
 
 
 def synthetic_gauges(m, C, names, seed=0):
@@ -1014,10 +1214,10 @@ def synthetic_gauges(m, C, names, seed=0):
 
 # ----------------------------------------------------------------------------- CLI
 def save_params(theta, C, a, best, names, path=None):
-    RESULTS.mkdir(exist_ok=True)
+    RESULTS.mkdir(parents=True, exist_ok=True)
     d = dict(theta=np.asarray(theta).tolist(), closure=C.spec, label=C.label, describe=C.describe(theta),
              res=a.res, year=a.year, seed=a.seed, fold=a.fold, kfolds=a.kfolds, scheme=a.scheme,
-             train_loss=best, constituents=names)
+             train_loss=best, constituents=names, env=env_info())
     (path or RESULTS / "params.json").write_text(json.dumps(_jsonable(d), indent=1))
 
 
@@ -1051,9 +1251,12 @@ def cmd_check(a):
     for d in r["grad"]:
         ok &= d["rel"] < 1e-3
         print(f"   {d['label']:18s} adjoint={d['adjoint']: .6e}  FD={d['fd']: .6e}  rel.err={d['rel']:.2e}")
-    print(f"[check] {C.label}: loss+grad in {r['seconds_loss_and_grad']:.1f} s  ->", "PASS" if ok else "FAIL")
-    RESULTS.mkdir(exist_ok=True)
+    print(f"[check] {C.label}: loss+grad in {r['seconds_loss_and_grad']:.2f} s (median)  ->", "PASS" if ok else "FAIL")
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    r["env"] = env_info()
     (RESULTS / f"check_{a.closure.replace(':', '_')}.json").write_text(json.dumps(_jsonable(r), indent=1))
+    if not ok:
+        sys.exit(1)
 
 
 def cmd_fit(a):
@@ -1071,11 +1274,12 @@ def cmd_fit(a):
             sys.exit("--fix-r0 only applies to phys closures")
         fixed[0] = theta0[0] = math.log(a.fix_r0)
     l2 = a.l2 if a.l2 is not None else C.l2_default
-    energy = dict(mu_D=a.energy_mu, mu_sh=a.energy_mu) if a.energy_mu else None
+    energy = dict(mu_D=a.energy_mu, mu_sh=a.energy_mu if a.energy_mu_sh is None else a.energy_mu_sh) \
+        if a.energy_mu else None
     print(f"[fit] {C.label}: {len(tr)} train / {len(te)} test, constituents {names}, l2={l2:g}, energy={energy}")
     fit = fit_theta(m, C, g, tr, names, w, theta0, l2, a.iters, fixed, energy, verbose=not a.quiet)
     save_params(fit["theta"], C, a, fit["loss"], names)
-    print("[fit] saved results/params.json:", C.describe(fit["theta"]))
+    print(f"[fit] saved {RESULTS / 'params.json'}:", C.describe(fit["theta"]))
 
 
 def cmd_eval(a):
@@ -1096,7 +1300,7 @@ def cmd_eval(a):
     print(f"{'GP':12s}" + "".join(f"{sc['gp_row'][n]:7.1f}" for n in MODEL_SET) + f"{sc['gp']:8.1f}")
     print(f"nearest {sc['nearest']:.1f}  equilibrium {sc['equilibrium']:.1f}  P(model>=GP) {sc['p_vs_gp']:.3f}")
     print(f"D_M2 {sc['D_TW']:.2f} TW, {100 * sc['shallow_frac']:.0f}% in H<500 m, closure {sc['energy_closure']['M2']:+.1e}")
-    RESULTS.mkdir(exist_ok=True)
+    RESULTS.mkdir(parents=True, exist_ok=True)
     (RESULTS / "eval.json").write_text(json.dumps(_jsonable(sc), indent=1))
 
 
@@ -1113,7 +1317,7 @@ def cmd_predict(a):
     eta = predict_series(Z, t)
     for n in MODEL_SET:
         print(f"  {n:3s} amp={abs(Z[n]) * 100:6.1f} cm  phase={(-np.degrees(np.angle(Z[n]))) % 360:6.1f}°")
-    RESULTS.mkdir(exist_ok=True)
+    RESULTS.mkdir(parents=True, exist_ok=True)
     out = RESULTS / f"predict_{a.lat:g}_{a.lon:g}.csv"
     np.savetxt(out, np.column_stack([t.astype("datetime64[s]").astype(str), np.round(eta, 3)]), fmt="%s",
                delimiter=",", header="time_utc,eta_m", comments="")
@@ -1140,15 +1344,19 @@ def main():
     ap.add_argument("--buffer-km", type=float, default=0.0)
     ap.add_argument("--closure", default="phys")
     ap.add_argument("--l2", type=float, default=None)
-    ap.add_argument("--energy-mu", type=float, default=0.0)
+    ap.add_argument("--energy-mu", type=float, default=0.0, help="weight mu_D of the D_M2 target")
+    ap.add_argument("--energy-mu-sh", type=float, default=None, help="weight of the shelf target (default = mu_D)")
     ap.add_argument("--fix-r0", type=float, default=None)
     ap.add_argument("--synthetic", action="store_true")
     ap.add_argument("--constituents", default="M2,S2,K1,O1")
     ap.add_argument("--iters", type=int, default=60)
+    ap.add_argument("--threads", type=int, default=None, help="torch CPU threads (for reproducible timings)")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--lat", type=float, default=21.3); ap.add_argument("--lon", type=float, default=202.1)
     ap.add_argument("--start", default="2024-06-01T00:00"); ap.add_argument("--hours", type=int, default=240)
     a = ap.parse_args()
+    if a.threads:
+        torch.set_num_threads(a.threads)
     CACHE.mkdir(exist_ok=True)
     {"check": cmd_check, "fit": cmd_fit, "eval": cmd_eval, "predict": cmd_predict, "split": cmd_split}[a.cmd](a)
 
