@@ -1,0 +1,31 @@
+{
+ "env": {
+  "hctide": "1.1.0",
+  "python": "3.11.3",
+  "numpy": "2.4.6",
+  "scipy": "1.17.1",
+  "torch": "2.14.0",
+  "platform": "macOS-26.3.1-arm64-arm-64bit",
+  "cpu": "Apple M4 Pro",
+  "torch_threads": 10,
+  "git_commit": "1106c9a",
+  "git_dirty": true
+ },
+ "results_dir": "/Users/boris/Desktop/research/pinns_new/results",
+ "n_gauges_built": 230,
+ "n_gauges_evaluated": 226,
+ "gauge_digest": "5cd0e6179e7c",
+ "exclude_ids": [
+  579,
+  600,
+  684,
+  833
+ ],
+ "fits_by_resolution": {
+  "2.0": {
+   "n_fits": 170,
+   "fit_seconds": 5984.402582168579
+  }
+ },
+ "note": "fit_seconds counts L-BFGS time only; wall-clock of `experiments.py all` also includes scoring/GP."
+}
