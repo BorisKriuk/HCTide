@@ -8,8 +8,8 @@
   "platform": "macOS-26.3.1-arm64-arm-64bit",
   "cpu": "Apple M4 Pro",
   "torch_threads": 10,
-  "git_commit": "1106c9a",
-  "git_dirty": true
+  "git_commit": "95461cc",
+  "git_dirty": false
  },
  "results_dir": "/Users/boris/Desktop/research/pinns_new/results",
  "n_gauges_built": 230,
@@ -23,8 +23,12 @@
  ],
  "fits_by_resolution": {
   "2.0": {
-   "n_fits": 170,
-   "fit_seconds": 5984.402582168579
+   "n_fits": 185,
+   "fit_seconds": 6204.430485963821
+  },
+  "1.0": {
+   "n_fits": 15,
+   "fit_seconds": 1449.9302623271942
   }
  },
  "note": "fit_seconds counts L-BFGS time only; wall-clock of `experiments.py all` also includes scoring/GP."
